@@ -1,0 +1,15 @@
+# Fichiers R générés automatiquement
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Outputs générés
+*.html
+*.pdf
+
+# Données lourdes (si pas nécessaires sur GitHub)
+*.csv
+*.xlsx
+*.rds
+*.RData
