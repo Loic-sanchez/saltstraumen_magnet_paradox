@@ -1,0 +1,340 @@
+#----------- Packages -----------#
+
+library(here)
+library(readr)
+library(ggplot2)
+library(scales)
+library(lubridate)
+library(dplyr)
+library(wesanderson)
+library(zoo)
+library(plotrix)
+library(pscl)
+library(patchwork)
+
+#------------ Load data ------------# 
+
+fishermen = readr::read_delim(file = here::here("data", "fishers.csv"),
+                              delim = ";",
+                              locale = locale(encoding="latin1"))
+
+fishermen_active = readr::read_delim(file = here::here("data", "active_fishermen.csv"), 
+                                     delim = ";",
+                                     locale = locale(encoding="latin1"))
+
+cars = readr::read_delim(file = here::here("data", "cars_may_oct.csv"),
+                         delim = ";")
+
+cars_filt = cars |>
+  dplyr::select(Dato, Felt, Trafikkmengde, `< 5,6m`) |>
+  dplyr::filter(Felt == "Totalt") |>
+  dplyr::rename(Date = "Dato",
+                Small_cars = `< 5,6m`) |> 
+  dplyr::mutate(rolling_mean_cars = rollmean(Small_cars, k = 7, fill = NA))  # 7-day window
+ggplot(data = cars_filt, aes(x = Date, y = rolling_mean_cars)) + geom_line()
+
+#------------ Tidy data -----------#
+
+# Counts from 'fishermen_active' are good but covariates are better filled 
+# in fishermen so we merge them:
+
+result <- anti_join(fishermen, fishermen_active, by = "Observation_ID") # these should be zero since inactive
+
+fishermen = fishermen |> 
+  dplyr::left_join(fishermen_active |> 
+                     dplyr::select(Observation_ID, 
+                                   Fishermen_count, 
+                                   Snags_count, 
+                                   Lost_gear), 
+                   by = "Observation_ID") |> 
+  dplyr::mutate(Fishermen_count = ifelse(Observation_ID %in% result$Observation_ID, 
+                                         0, 
+                                         Fishermen_count.y),
+                Snags_count = ifelse(Observation_ID %in% result$Observation_ID, 
+                                     0, 
+                                     Snags_count.y),
+                Lost_gear = ifelse(Observation_ID %in% result$Observation_ID, 
+                                   0, 
+                                   Lost_gear.y))
+
+# Now we only selected the active fishermen while keeping their zeroes.
+
+fishermen = fishermen |> dplyr::mutate(Date = dmy(Date))  # dmy = day-month-year
+
+fishermen$Weather_std[fishermen$Weather_std == "Hvis ukendt"] = "cloudy / overcast"
+
+fishermen = fishermen |> 
+  dplyr::left_join(cars_filt |> dplyr::select(Date, Small_cars)) # Add tourism proxy
+
+fishermen$Week_type <- ifelse(fishermen$Weekday %in% c("lørdag", "søndag"), 
+                              "weekend", 
+                              "weekday") #Transform multiple levels into binary
+
+##############################################
+#------------- Basic analysis ---------------#
+##############################################
+
+#---- Fishing events ----#
+
+summary(fishermen$Fishermen_count) # min, max, average, median per obs window
+std.error(fishermen$Fishermen_count) # Associated S.E.
+
+# Per day/zone
+
+fishermen_summary <- fishermen  |> 
+  group_by(Date, 
+           Zone)  |>  # This will give counts per day and zone 
+  summarise(Fishermen_count = sum(Fishermen_count, na.rm = TRUE))
+
+fish_tot = fishermen_summary |> 
+  group_by(Date) |> #This will give counts per day (zones merged)
+  summarise(tot = sum(Fishermen_count))
+
+summary(fish_tot$tot) # min, max, average, median per obs window  
+std.error(fish_tot$tot) # Associated S.E.
+
+total_estimated_anglers = mean(fish_tot$tot)*89 # Estimate of total anglers over the 89 days
+
+#---- Snags/Gear Loss ----#
+
+snag_rate = sum(fishermen$Snags_count)/sum(fishermen$Fishermen_count)
+loss_rate = sum(fishermen$Lost_gear)/sum(fishermen$Fishermen_count)
+estimated_loss = loss_rate*total_estimated_anglers # Estimate of total loss over the 89 days
+
+##############################################
+#---------------- Modelling -----------------#
+##############################################
+
+plot(fishermen$Date, fishermen$Fishermen_count) # Pre-visualize if quadratic
+
+# Set up model for fishing events
+
+mod = MASS::glm.nb(Fishermen_count ~ Cleaned_tidal + Week_type + Time_block + Zone + 
+                     Weather_std + Current + poly(as.numeric(Date),2) + Small_cars,
+                   data = fishermen)
+
+# Check model fit
+
+plot(DHARMa::simulateResiduals(mod)) # Nice fit ! 
+
+# Explanatory power
+
+performance::r2_nagelkerke(mod) # High
+
+# predictive power for curiosity
+
+cor(predict(mod), fishermen$Fishermen_count)^2 # Moderate
+
+# Check coefficients and visualize some relationships
+
+summary(mod)
+
+visreg::visreg(mod, xvar = "Time_block", type = "conditional", scale = "response")
+visreg::visreg(mod, xvar = "Weather_std", type = "conditional", scale = "response")
+visreg::visreg(mod, xvar = "Week_type", type = "conditional", scale = "response")
+visreg::visreg(mod, xvar = "Current", type = "conditional", scale = "response")
+visreg::visreg(mod, xvar = "Cleaned_tidal", type = "conditional", scale = "response")
+visreg::visreg(mod, xvar = "Zone", type = "conditional", scale = "response")
+visreg::visreg(mod, xvar = "Small_cars", type = "conditional", scale = "response")
+visreg::visreg(mod, xvar = "Date", type = "conditional", scale = "response")
+
+# Set up models for snags/loss
+
+fishermen_clean <- fishermen[fishermen$Fishermen_count > 0, ] # Keep only times when there were fishing events
+
+# Snagging 
+
+mod_zero <- glm(I(Snags_count > 0) ~ Cleaned_tidal + Zone + Week_type + Weather_std + Time_block+
+                  Current + Fishermen_count + poly(as.numeric(Date),2),
+                family = binomial,
+                data = fishermen_clean)
+
+plot(DHARMa::simulateResiduals(mod_zero))
+summary(mod_zero)
+performance::r2_nagelkerke(mod_zero)
+
+# Gear loss
+
+mod_zero_loss <- glm(I(Lost_gear > 0) ~ Cleaned_tidal + Zone + Week_type + Weather_std + Time_block+
+                       Current + Fishermen_count + poly(as.numeric(Date),2),
+                     family = binomial,
+                     data = fishermen_clean)
+
+plot(DHARMa::simulateResiduals(mod_zero_loss))
+summary(mod_zero_loss)
+performance::r2_nagelkerke(mod_zero_loss)
+
+##############################################
+#--------------- Plots/maps -----------------#
+##############################################
+
+################ Fig 2a/2b ###################
+
+fishermen_summary <- fishermen_summary %>%
+  group_by(Zone) %>%
+  mutate(rolling_mean = rollmean(Fishermen_count, k = 5, fill = NA)) |>
+  dplyr::left_join(cars_filt |>
+                     dplyr::select(Date, Small_cars, rolling_mean_cars)) 
+
+roll_min2 <- function(x, k) {
+  sapply(seq_along(x), function(i) {
+    window <- x[max(1, i - k + 1):i]
+    window <- window[!is.na(window)]
+    if (length(window) >= 2) mean(window) else NA
+  })
+}
+
+weekends <- fishermen_summary %>%
+  filter(weekdays(Date) %in% c("samedi", "dimanche")) %>%
+  mutate(
+    xmin = Date - 0.5,
+    xmax = Date + 0.5,
+    ymin = -Inf,
+    ymax = Inf)
+
+fishermen_summary$rolling_mean2 <- roll_min2(fishermen_summary$Fishermen_count, k = 5)
+
+scale_factor <- max(fishermen_summary$Fishermen_count, na.rm = TRUE) /
+  max(fishermen_summary$rolling_mean_cars, na.rm = TRUE)
+
+p1 = ggplot(fishermen_summary, aes(x = Date, y = Fishermen_count, color = Zone)) +
+  geom_rect(data = weekends, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            inherit.aes = FALSE, fill = "grey85", alpha = 0.3) +
+  # geom_line(aes(color = Zone), linewidth = 1.2) +
+  geom_line(aes(y = rolling_mean, color = Zone), linewidth = 1.2) +
+  geom_point(
+    aes(fill = Zone),
+    shape = 21, size = 2, stroke = 1, alpha = 0.5
+  ) +
+  geom_line(aes(y = rolling_mean_cars * scale_factor),
+            color = "grey40", alpha = 0.5, linewidth = 0.8, linetype = "dashed") +  # Mise en forme des dates sur l'axe X
+  scale_x_date(
+    date_breaks = "1 week",
+    labels = label_date(format = "W%V\n%b", locale = "en")
+  ) +
+  scale_color_manual(values = wes_palette("FantasticFox1")[3:4]) +
+  scale_fill_manual(values =  wes_palette("FantasticFox1")[3:4]) +
+  scale_y_continuous(
+    name = "Fishing events per day",
+    breaks = seq(0, 80, by = 10),
+    sec.axis = sec_axis(
+      transform = ~ . / scale_factor,
+      name = "Detected cars / day (< 5.6m)"
+    )
+  ) +
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank(),
+        legend.position = "none",
+        axis.title.y = element_text(vjust = 3)) +
+  ylab("Fishing events per day") +
+  xlab("")
+
+fishermen_snags = fishermen %>%
+  group_by(Date, Zone) %>%
+  summarise(lost = sum(Lost_gear, na.rm = TRUE))
+
+fishermen_summary$lost_count = fishermen_snags$lost
+fishermen_summary = fishermen_summary |> 
+  dplyr::mutate(lost_percent = lost_count/Fishermen_count)
+
+fishermen_summary <- fishermen_summary %>%
+  group_by(Zone) %>%
+  mutate(rolling_mean_lost = rollmean(lost_percent, k = 5, fill = NA))  # fenêtre 7 jours
+
+p2 = ggplot(fishermen_summary |> 
+              dplyr::filter(Fishermen_count > 9), 
+            aes(x = Date, 
+                y = lost_percent, 
+                color = Zone)) +
+  geom_rect(data = weekends, aes(xmin = xmin, 
+                                 xmax = xmax, 
+                                 ymin = ymin, 
+                                 ymax = ymax),
+            inherit.aes = FALSE, 
+            fill = "grey85", 
+            alpha = 0.3) +
+  # geom_line(aes(color = Zone), linewidth = 1.2) +
+  geom_line(aes(y = rolling_mean_lost,
+                color = Zone),
+            linewidth = 1.2) +
+  geom_point(aes(fill = Zone),
+             shape = 21, size = 2, stroke = 1, alpha = 0.5) +
+  scale_x_date(
+    date_breaks = "1 week",
+    labels = label_date(format = "W%V\n%b", locale = "en")
+  ) +
+  scale_y_continuous(breaks = seq(0, 0.2, by = 0.05),
+                     minor_breaks = seq(0, 0.2, by = 0.01)) +
+  guides(y = guide_axis(minor.ticks = TRUE))+
+  scale_color_manual(values = wes_palette("FantasticFox1")[3:4]) +
+  scale_fill_manual(values =  wes_palette("FantasticFox1")[3:4]) +
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank(),
+        legend.position = "none", 
+        axis.title.y = element_text(vjust = 3)) +  
+  ylab("Percentage of gear loss per day")
+
+p1/p2
+
+ggsave(here::here("outputs", "fig_2ab.png"), width = 8, height = 12, dpi = 300)
+
+### Map before Canva editing (for text) ###
+
+library(sf)
+
+polygones <- unique(st_read(here::here("data", "polygons", "polys.geojson")))
+counts_poly = readr::read_delim(file = here::here("data", "spatial_data.csv"), 
+                                delim = ";")
+
+polygones_joined <- polygones |> 
+  left_join(counts_poly, by = "name") |> 
+  dplyr::filter(name != "B8") |> 
+  dplyr::rename(Snag_percent = "Snag%",
+                Lost_percent = "Lost%")
+
+polygones_joined <- polygones_joined |>
+  mutate(
+    area_m2 = as.numeric(st_area(geometry)),
+    obs_win = ifelse(Zone == "A", 68, 70),
+    fishing_window = Total_fishing / (obs_win)   
+  )
+
+library(ggplot2)
+library(ggplot2)
+library(ggspatial)
+library(ggfx)
+
+main_map = ggplot(polygones_joined) +
+  annotation_map_tile(type = "cartolight", zoom = 15) +
+  geom_sf(aes(fill = Zone), color = "black", linewidth = 0.5, alpha = 0.75
+  ) +
+  coord_sf(
+    xlim = c(14.575, 14.645),
+    ylim = c(67.218, 67.248),
+    expand = FALSE
+  ) +
+  scale_x_continuous(breaks = c(14.58, 14.61, 14.64)) +
+  scale_y_continuous(breaks = c(67.22, 67.23, 67.24)) +
+  annotation_north_arrow(location = "tr", style = north_arrow_nautical()) +
+  annotation_scale(location = "bl", 
+                   text_col = "black",
+                   line_col = "black") +
+  theme_minimal() +
+  theme(
+    legend.position = c(0.94, 0.82),       
+    legend.background = element_rect(
+      fill = alpha("black", 0.9),            # fond semi-transparent sombre
+      color = NA
+    ),
+    legend.title = element_text(color = "white", size = 11, face = "bold"),
+    legend.text = element_text(color = "white", size = 9),
+    legend.key.width = unit(0.4, "cm"),
+    legend.key.height = unit(0.8, "cm"),
+    axis.text = element_text(size = 12, color = "black"),
+    legend.ticks = element_blank()
+  ) +
+  scale_fill_manual(values =  wes_palette("FantasticFox1")[3:4]) +
+  xlab("") + ylab("") 
+
+ggsave(main_map, filename = here::here("outputs", "p_main.png"), dpi = 300, width = 9, height = 8) 
+
