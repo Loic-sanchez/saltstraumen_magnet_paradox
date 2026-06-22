@@ -225,7 +225,9 @@ p1 = ggplot(fishermen_summary, aes(x = Date, y = Fishermen_count, color = Zone))
   theme_bw(base_size = 13) +
   theme(panel.grid = element_blank(),
         legend.position = "none",
-        axis.title.y = element_text(vjust = 3)) +
+        axis.title.y = element_text(vjust = 3),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 17)) +
   ylab("Fishing events per day") +
   xlab("")
 
@@ -271,12 +273,14 @@ p2 = ggplot(fishermen_summary |>
   theme_bw(base_size = 13) +
   theme(panel.grid = element_blank(),
         legend.position = "none", 
-        axis.title.y = element_text(vjust = 3)) +  
+        axis.title.y = element_text(vjust = 3),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 17)) +  
   ylab("Percentage of gear loss per day")
 
 p1/p2
 
-ggsave(here::here("outputs", "fig_2ab.png"), width = 8, height = 12, dpi = 300)
+ggsave(here::here("outputs", "fig_4.png"), width = 8, height = 12, dpi = 300)
 
 ### Map before Canva editing (for text) ###
 
@@ -323,7 +327,7 @@ main_map = ggplot(polygones_joined) +
   theme(
     legend.position = c(0.94, 0.82),       
     legend.background = element_rect(
-      fill = alpha("black", 0.9),            # fond semi-transparent sombre
+      fill = alpha("black", 0.9),            
       color = NA
     ),
     legend.title = element_text(color = "white", size = 11, face = "bold"),
